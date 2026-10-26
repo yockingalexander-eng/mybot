@@ -60,3 +60,27 @@ In Discord, run `/syncfto`. The sheet should populate with FTO members.
   left untouched so manually entered data is preserved.
 - Phase is set to "Certified" and Status to "Active" for high-command members.
 - Keep `credentials.json` and `.env` secret.
+
+## Deploying to Railway (or other containers)
+
+`credentials.json` is gitignored, so it is NOT present in the deployed image.
+To authenticate Google Sheets on Railway, set one of these environment variables
+in the Railway service settings (Variables tab):
+
+- `GOOGLE_SERVICE_ACCOUNT_JSON` — paste the **entire contents** of `credentials.json`
+  as a single-line JSON string. This takes precedence over the key file.
+- (Alternative) `GOOGLE_SERVICE_ACCOUNT_KEY` — base64-encoded contents of
+  `credentials.json`.
+
+The bot reads these automatically and falls back to `./credentials.json` for
+local development. If neither is present, sync will fail with a clear error
+instead of a cryptic `ENOENT`.
+
+Quick way to produce the value locally (PowerShell):
+```powershell
+Get-Content .\credentials.json -Raw
+```
+Or base64:
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('.\credentials.json'))
+```

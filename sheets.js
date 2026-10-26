@@ -9,8 +9,54 @@ function parseSheetId(raw) {
 }
 
 const SPREADSHEET_ID = parseSheetId(process.env.GOOGLE_SHEET_ID);
-const KEY_FILE = process.env.GOOGLE_SERVICE_ACCOUNT_KEY || './credentials.json';
 const SHEET_NAME = process.env.SHEET_NAME || 'Roster';
+
+// Resolve Google service account credentials in a deployment-friendly way.
+// Supports (in order): a JSON string env var, a base64-encoded JSON env var,
+// a GOOGLE_SERVICE_ACCOUNT_KEY that contains JSON, or a key file path.
+function resolveCredentials() {
+  const jsonCandidates = [
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
+    process.env.GOOGLE_CREDENTIALS_JSON,
+    process.env.SERVICE_ACCOUNT_JSON,
+    process.env.GCP_SERVICE_ACCOUNT_JSON,
+  ];
+  for (const c of jsonCandidates) {
+    if (c && c.trim()) {
+      const trimmed = c.trim();
+      try {
+        if (trimmed.startsWith('{')) return { type: 'object', value: JSON.parse(trimmed) };
+        const decoded = Buffer.from(trimmed, 'base64').toString('utf8').trim();
+        if (decoded.startsWith('{')) return { type: 'object', value: JSON.parse(decoded) };
+      } catch (e) {
+        throw new Error('Invalid Google service account JSON in environment variable: ' + e.message);
+      }
+    }
+  }
+
+  const key = (process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '').trim();
+  if (key.startsWith('{')) {
+    try {
+      return { type: 'object', value: JSON.parse(key) };
+    } catch (e) {
+      throw new Error('Invalid Google service account JSON in GOOGLE_SERVICE_ACCOUNT_KEY: ' + e.message);
+    }
+  }
+
+  const keyFile = key && !key.startsWith('{')
+    ? key
+    : (process.env.GOOGLE_APPLICATION_CREDENTIALS || './credentials.json');
+
+  if (fs.existsSync(keyFile)) {
+    return { type: 'file', value: keyFile };
+  }
+
+  throw new Error(
+    'Google service account credentials not found. ' +
+    'On Railway/Heroku set GOOGLE_SERVICE_ACCOUNT_JSON to the full contents of credentials.json ' +
+    '(or GOOGLE_SERVICE_ACCOUNT_KEY to a valid file path). Looked for file: ' + keyFile
+  );
+}
 const SECTIONS_FILE = process.env.SECTIONS_FILE || './sections.json';
 const HC_START_ROW = 11;
 const HC_ROWS = 10;
@@ -40,15 +86,15 @@ function loadSections() {
 async function getClient() {
   if (sheetsClient) return sheetsClient;
   let auth;
-  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  const resolved = resolveCredentials();
+  if (resolved.type === 'object') {
     auth = new google.auth.GoogleAuth({
-      credentials: creds,
+      credentials: resolved.value,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
   } else {
     auth = new google.auth.GoogleAuth({
-      keyFile: KEY_FILE,
+      keyFile: resolved.value,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
   }
