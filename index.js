@@ -21,6 +21,7 @@ const { syncMembers, setAssignedFTO, getAssignedFTO, getAssignedFTOMap, probatio
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
+if (!GUILD_ID) console.warn('DISCORD_GUILD_ID is not set; roster sync and panels will be disabled.');
 const FTO_ROLE_ID = process.env.FTO_ROLE_ID;
 const APPLICANT_CHANNEL_ID = '1327114656942391374';
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID || null;
