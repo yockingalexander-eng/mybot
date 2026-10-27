@@ -17,7 +17,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require('discord.js');
-const { syncMembers, setAssignedFTO, getAssignedFTO, getAssignedFTOMap, probationaryPhase, setStatus, appendAudit, ensureScheduleSheet, appendSchedule, getSchedule, getAllSchedules, updateSchedule } = require('./sheets');
+const { syncMembers, setStatus, appendAudit, ensureScheduleSheet, appendSchedule, getSchedule, getAllSchedules, updateSchedule } = require('./sheets');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
@@ -130,161 +130,6 @@ function runSync(guild) {
     .then((count) => { lastSyncAt = Date.now(); return count; })
     .catch((e) => console.error('Sync failed:', e));
   return syncChain;
-}
-
-async function getProbationaryMembers(guild) {
-  await fetchMembersWithRetry(guild);
-  const sections = loadSections();
-  const probSection = sections[3];
-  const probRoles = probSection ? probSection.roles : [];
-  const members = [];
-  for (const m of guild.members.cache.values()) {
-    if (m.user.bot) continue;
-    const names = new Set(m.roles.cache.map((r) => r.name.toLowerCase()));
-    const ids = new Set(m.roles.cache.map((r) => r.id));
-    const isProb = probRoles.some((r) => ids.has(r) || names.has(String(r).toLowerCase()));
-    if (isProb) {
-      members.push({ member: m, phase: probationaryPhase(m) });
-    }
-  }
-  members.sort((a, b) =>
-    (a.member.displayName || a.member.user.username).localeCompare(
-      b.member.displayName || b.member.user.username
-    )
-  );
-  return members;
-}
-
-async function getFTOMembers(guild) {
-  await fetchMembersWithRetry(guild);
-  const ftos = [];
-  for (const m of guild.members.cache.values()) {
-    if (m.user.bot) continue;
-    const hasRole =
-      (FTO_ROLE_ID && m.roles.cache.has(FTO_ROLE_ID)) ||
-      m.roles.cache.some((r) => r.name.toLowerCase() === 'field training officer' || r.name.toLowerCase() === 'fto');
-    if (hasRole) ftos.push(m);
-  }
-  ftos.sort((a, b) =>
-    (a.displayName || a.user.username).localeCompare(b.displayName || b.user.username)
-  );
-  return ftos;
-}
-
-async function buildPanel(guild) {
-  const probMembers = await getProbationaryMembers(guild);
-  const embed = new EmbedBuilder()
-    .setTitle('FTO Assignment Panel')
-    .setDescription('Probationary troopers needing training. Click a trooper button to assign an FTO.')
-    .setColor(0x5865f2);
-
-  const assignedMap = await getAssignedFTOMap();
-  const lines = [];
-  for (const { member, phase } of probMembers) {
-    const assigned = assignedMap.get(member.id) || '';
-    lines.push(`**${member.displayName || member.user.username}** — ${phase} (Assigned: ${assigned || 'none'})`);
-  }
-  // Split into multiple fields so all members fit (Discord field value max 1024 chars)
-  const chunks = [];
-  let current = '';
-  for (const line of lines) {
-    if (current && (current + '\n' + line).length > 1024) {
-      chunks.push(current);
-      current = line;
-    } else {
-      current = current ? current + '\n' + line : line;
-    }
-  }
-  if (current) chunks.push(current);
-  if (!chunks.length) chunks.push('None');
-  chunks.forEach((c, i) => {
-    embed.addFields({
-      name: i === 0 ? 'Probationary Troopers' : `Probationary Troopers (${i + 1})`,
-      value: c,
-      inline: false,
-    });
-  });
-
-  const components = [];
-  const buttons = [];
-  for (const { member } of probMembers.slice(0, 25)) {
-    const assigned = assignedMap.get(member.id) || '';
-    const label = (member.displayName || member.user.username).slice(0, 40);
-    const btn = new ButtonBuilder()
-      .setCustomId(`fto_pick:${member.id}`)
-      .setLabel(label)
-      .setStyle(assigned ? ButtonStyle.Secondary : ButtonStyle.Primary);
-    buttons.push(btn);
-    if (buttons.length === 5) {
-      components.push(new ActionRowBuilder().addComponents(...buttons.splice(0, 5)));
-    }
-  }
-  if (buttons.length) {
-    components.push(new ActionRowBuilder().addComponents(...buttons));
-  }
-
-  return { embeds: [embed], components };
-}
-
-async function postPanelToChannel(guild) {
-  const channelId = '1561927395953475654';
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel || !channel.isTextBased()) {
-    console.log('fto-announcement channel not found or not text-based.');
-    return;
-  }
-  const panel = await buildPanel(guild);
-  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-  const existing = messages
-    ? messages.find((m) => m.author.id === client.user.id && m.embeds.some((e) => e.title === 'FTO Assignment Panel'))
-    : null;
-  if (existing) {
-    await existing.edit(panel);
-    console.log('Updated existing panel in fto-announcement.');
-  } else {
-    await channel.send(panel);
-    console.log('Posted new panel in fto-announcement.');
-  }
-}
-
-async function postSchedulePanel(guild) {
-  const channel = await client.channels.fetch(APPLICANT_CHANNEL_ID).catch(() => null);
-  if (!channel || !channel.isTextBased()) return;
-  const embed = new EmbedBuilder()
-    .setTitle('FTO Scheduling')
-    .setDescription('Probationary troopers: request an FTO session (interview, ride-along, or training). Click the button below or use `/schedule`.')
-    .setColor(0x5865f2);
-  const btn = new ButtonBuilder()
-    .setCustomId('sched_create')
-    .setLabel('Create Schedule')
-    .setStyle(ButtonStyle.Primary);
-  const row = new ActionRowBuilder().addComponents(btn);
-  const panel = { embeds: [embed], components: [row] };
-  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
-  const existing = messages
-    ? messages.find((m) => m.author.id === client.user.id && m.embeds.some((e) => e.title === 'FTO Scheduling'))
-    : null;
-  if (existing) {
-    await existing.edit(panel).catch((e) => console.error('sched panel edit failed', e?.message));
-    console.log('Updated existing schedule panel.');
-  } else {
-    await channel.send(panel).catch((e) => console.error('sched panel send failed', e?.message));
-    console.log('Posted new schedule panel.');
-  }
-}
-
-function normalizeTypes(input) {
-  const allowed = ['Interview', 'Ride-Along', 'Training'];
-  const parts = String(input || '').split(/[,/]+/).map((p) => p.trim()).filter(Boolean);
-  const out = [];
-  for (const p of parts) {
-    const key = p.toLowerCase().replace(/[-\s]/g, '');
-    const match = allowed.find((a) => a.toLowerCase().replace(/-/g, '') === key);
-    out.push(match || p);
-  }
-  const seen = new Set();
-  const uniq = out.filter((t) => (seen.has(t.toLowerCase()) ? false : (seen.add(t.toLowerCase()), true)));
-  return uniq.length ? uniq.join(', ') : 'Interview';
 }
 
 async function createScheduleRequest(interaction, data) {
@@ -775,53 +620,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
-    if (action !== 'fto_pick' && action !== 'fto_toggle') return;
-    try {
-      await interaction.deferUpdate();
-      const guild = interaction.guild;
-      const member = await guild.members.fetch(memberId).catch(() => null);
-      if (!member) {
-        await interaction.followUp({ content: 'Member not found.', flags: 64 });
-        return;
-      }
-      const ftos = await getFTOMembers(guild);
-      if (!ftos.length) {
-        await interaction.followUp({ content: 'No FTOs found (role not assigned to anyone).', flags: 64 });
-        return;
-      }
-      const current = await getAssignedFTO(memberId);
-      const options = [
-        new StringSelectMenuOptionBuilder()
-          .setLabel('Unassign FTO')
-          .setValue('__unassign__')
-          .setDescription('Remove the currently assigned FTO')
-          .setDefault(current === ''),
-      ];
-      for (const fto of ftos.slice(0, 24)) {
-        const name = (fto.displayName || fto.user.username).slice(0, 100);
-        options.push(
-          new StringSelectMenuOptionBuilder()
-            .setLabel(name.slice(0, 25))
-            .setValue(fto.id)
-            .setDescription(`Assign ${name}`.slice(0, 100))
-            .setDefault(current === name)
-        );
-      }
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(`fto_select:${memberId}`)
-        .setPlaceholder(`Assign an FTO to ${member.displayName || member.user.username}`.slice(0, 150))
-        .addOptions(options);
-      const row = new ActionRowBuilder().addComponents(select);
-      await interaction.followUp({
-        content: `Select an FTO to assign to **${member.displayName || member.user.username}** (currently: ${current || 'none'}).`,
-        components: [row],
-        flags: 64,
-      });
-    } catch (e) {
-      console.error(e);
-      await interaction.followUp({ content: 'Failed to open assignment menu.', flags: 64 });
-    }
-  }
 
   if (interaction.isModalSubmit()) {
     const [modalAction, modalId] = interaction.customId.split(':');
@@ -886,43 +684,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
-
-  if (interaction.isStringSelectMenu()) {
-    const [action, memberId] = interaction.customId.split(':');
-    if (action !== 'fto_select') return;
-    try {
-      await interaction.deferUpdate();
-      const guild = interaction.guild;
-      const member = await guild.members.fetch(memberId).catch(() => null);
-      if (!member) {
-        await interaction.followUp({ content: 'Member not found.', flags: 64 });
-        return;
-      }
-      const actor = interaction.user.displayName || interaction.user.username;
-      const selected = interaction.values[0];
-      let newValue = '';
-      let ftoName = '';
-      if (selected === '__unassign__') {
-        newValue = '';
-      } else {
-        const ftoMember = await guild.members.fetch(selected).catch(() => null);
-        ftoName = ftoMember ? (ftoMember.displayName || ftoMember.user.username) : selected;
-        newValue = ftoName;
-      }
-      await setAssignedFTO(memberId, newValue);
-      await auditLog(guild, {
-        actor,
-        action: newValue ? 'FTO Assigned' : 'FTO Unassigned',
-        target: member.displayName || member.user.username,
-        details: newValue ? `FTO ${newValue} assigned (Probationary ID ${memberId})` : `FTO unassigned (Probationary ID ${memberId})`,
-      });
-      const replyText = newValue ? `Assigned ${newValue} to ${member.displayName || member.user.username}.` : `Unassigned FTO from ${member.displayName || member.user.username}.`;
-      await interaction.editReply({ content: replyText, components: [] });
-    } catch (e) {
-      console.error(e);
-      await interaction.followUp({ content: 'Failed to update assignment.', flags: 64 });
-    }
-  }
+}
 });
 
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
