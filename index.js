@@ -55,11 +55,7 @@ const commands = [
     .setName('schedule')
     .setDescription('Request an FTO session (interview, ride-along, or training)')
     .addStringOption((opt) =>
-      opt.setName('type').setDescription('Session type').setRequired(true).addChoices(
-        { name: 'Interview', value: 'Interview' },
-        { name: 'Ride-Along', value: 'Ride-Along' },
-        { name: 'Training', value: 'Training' }
-      )
+      opt.setName('type').setDescription('Session type(s), comma-separated (Interview, Ride-Along, Training)').setRequired(true)
     )
     .addStringOption((opt) => opt.setName('date').setDescription('Date (YYYY-MM-DD)').setRequired(true))
     .addStringOption((opt) => opt.setName('time').setDescription('Time (HH:MM)').setRequired(true))
@@ -277,10 +273,25 @@ async function postSchedulePanel(guild) {
   }
 }
 
+function normalizeTypes(input) {
+  const allowed = ['Interview', 'Ride-Along', 'Training'];
+  const parts = String(input || '').split(/[,/]+/).map((p) => p.trim()).filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    const key = p.toLowerCase().replace(/[-\s]/g, '');
+    const match = allowed.find((a) => a.toLowerCase().replace(/-/g, '') === key);
+    out.push(match || p);
+  }
+  const seen = new Set();
+  const uniq = out.filter((t) => (seen.has(t.toLowerCase()) ? false : (seen.add(t.toLowerCase()), true)));
+  return uniq.length ? uniq.join(', ') : 'Interview';
+}
+
 async function createScheduleRequest(interaction, data) {
   console.log('createScheduleRequest start', data);
   const guild = interaction.guild;
-  const { type, date, time } = data;
+  const type = normalizeTypes(data.type);
+  const { date, time } = data;
   const notes = data.notes || '';
   if (!date || !time) {
     const reply = interaction.deferred || interaction.replied ? interaction.editReply : interaction.reply.bind(interaction);
@@ -612,7 +623,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       try {
         const modal = new ModalBuilder().setCustomId('sched_modal').setTitle('Create Schedule');
       modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('type').setLabel('Type (Interview/Ride-Along/Training)').setStyle(TextInputStyle.Short).setRequired(true)),
+        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('type').setLabel('Type(s) (Interview/Ride-Along/Training)').setStyle(TextInputStyle.Short).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel('Date (MM-DD-YYYY)').setStyle(TextInputStyle.Short).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel('Time (any format)').setStyle(TextInputStyle.Short).setRequired(true)),
         new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('Notes').setStyle(TextInputStyle.Paragraph).setRequired(false))
@@ -818,7 +829,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.log('sched_modal submitted by', interaction.user.tag);
       await interaction.deferReply({ flags: 64 });
       const data = {
-        type: interaction.fields.getTextInputValue('type'),
+        type: normalizeTypes(interaction.fields.getTextInputValue('type')),
         date: interaction.fields.getTextInputValue('date'),
         time: interaction.fields.getTextInputValue('time'),
         duration: 60,
