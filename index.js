@@ -24,6 +24,7 @@ const GUILD_ID = process.env.DISCORD_GUILD_ID;
 if (!GUILD_ID) console.warn('DISCORD_GUILD_ID is not set; roster sync and panels will be disabled.');
 const FTO_ROLE_ID = process.env.FTO_ROLE_ID;
 const APPLICANT_CHANNEL_ID = '1327114656942391374';
+const FTO_CATEGORY_ID = '1327114657894502428';
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID || null;
 const SECTIONS_FILE = process.env.SECTIONS_FILE || './sections.json';
 
@@ -33,6 +34,14 @@ function loadSections() {
   } catch (e) {
     return [];
   }
+}
+
+function isAllowedCommandChannel(interaction) {
+  const ch = interaction.channel;
+  if (!ch) return true;
+  if (ch.id === APPLICANT_CHANNEL_ID) return true;
+  if (ch.parentId === FTO_CATEGORY_ID) return true;
+  return false;
 }
 
 const client = new Client({
@@ -396,6 +405,10 @@ client.on(Events.GuildMemberRemove, async (member) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand()) {
+    if (!isAllowedCommandChannel(interaction)) {
+      await interaction.reply({ content: 'This command is only available in FTO channels.', flags: 64 }).catch(() => {});
+      return;
+    }
     // Allow commands anywhere in the guild
     if (interaction.commandName === 'syncfto') {
       await interaction.deferReply({ flags: 64 });
