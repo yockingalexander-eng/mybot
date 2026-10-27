@@ -170,10 +170,10 @@ async function postCommandGuide(guild) {
     ? messages.find((m) => m.author.id === client.user.id && m.embeds.some((e) => e.title === 'FTO Command Guide'))
     : null;
   if (existing) {
-    await existing.edit({ embeds: [embed] }).catch((e) => console.error('guide edit failed', e?.message));
+    await existing.edit({ content: `<@&${FTO_ROLE_ID}>`, embeds: [embed] }).catch((e) => console.error('guide edit failed', e?.message));
     console.log('Updated existing command guide in fto-announcement.');
   } else {
-    await channel.send({ embeds: [embed] }).catch((e) => console.error('guide send failed', e?.message));
+    await channel.send({ content: `<@&${FTO_ROLE_ID}>`, embeds: [embed] }).catch((e) => console.error('guide send failed', e?.message));
     console.log('Posted new command guide in fto-announcement.');
   }
 }
