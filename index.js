@@ -141,7 +141,7 @@ async function postCommandGuide(guild) {
   }
   const embed = new EmbedBuilder()
     .setTitle('FTO Command Guide')
-    .setDescription('Quick reference for Field Training Officers. All commands work anywhere in the server.')
+    .setDescription('Quick reference for Field Training Officers. Commands work in FTO and applicant channels.')
     .setColor(0x5865f2)
     .addFields(
       { name: 'Slash Commands', value:
