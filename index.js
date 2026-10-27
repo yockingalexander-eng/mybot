@@ -132,6 +132,52 @@ function runSync(guild) {
   return syncChain;
 }
 
+async function postCommandGuide(guild) {
+  const channelId = '1563951331587399710';
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) {
+    console.log('fto-announcement channel not found or not text-based.');
+    return;
+  }
+  const embed = new EmbedBuilder()
+    .setTitle('FTO Command Guide')
+    .setDescription('Quick reference for Field Training Officers. All commands work anywhere in the server.')
+    .setColor(0x5865f2)
+    .addFields(
+      { name: 'Slash Commands', value:
+        '`/schedule` — Request an FTO session. Type(s) comma-separated (e.g. `Interview, Ride-Along`), plus date, time, duration, notes. Pings all FTOs.\n' +
+        '`/myschedule` — View your own schedule requests and their status.\n' +
+        '`/openrequests` — View all open (unclaimed) schedule requests.\n' +
+        '`/reopenschedule <id>` — Reopen a completed or no-show schedule (FTO only).\n' +
+        '`/syncfto` — Manually sync the roster to the Google Sheet (admin).\n' +
+        '`/graduate @member` — Mark a member as Graduated in the roster (admin).',
+        inline: false },
+      { name: 'Button Flows', value:
+        'Schedule panel (applicant channel) — "Create Schedule" opens a form; or use `/schedule`.\n' +
+        'Claim — FTO claims an open request; applicant is notified.\n' +
+        'Complete / No-Show — type `COMPLETE` or `NO-SHOW` to confirm; marks done and adds a Reopen button.\n' +
+        'Reopen — reverts a completed/no-show schedule back to Claimed or Open.\n' +
+        'Cancel — requester cancels their own open request.',
+        inline: false },
+      { name: 'Tips', value:
+        'You can request multiple session types in one request (e.g. `Interview, Ride-Along`).\n' +
+        'Statuses: Open → Claimed → Completed / No-Show / Canceled.\n' +
+        'If you complete a session by accident, use the Reopen button or `/reopenschedule`.',
+        inline: false }
+    );
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  const existing = messages
+    ? messages.find((m) => m.author.id === client.user.id && m.embeds.some((e) => e.title === 'FTO Command Guide'))
+    : null;
+  if (existing) {
+    await existing.edit({ embeds: [embed] }).catch((e) => console.error('guide edit failed', e?.message));
+    console.log('Updated existing command guide in fto-announcement.');
+  } else {
+    await channel.send({ embeds: [embed] }).catch((e) => console.error('guide send failed', e?.message));
+    console.log('Posted new command guide in fto-announcement.');
+  }
+}
+
 async function createScheduleRequest(interaction, data) {
   console.log('createScheduleRequest start', data);
   const guild = interaction.guild;
@@ -257,6 +303,7 @@ client.once(Events.ClientReady, async (c) => {
       await runSync(guild);
       await ensureScheduleSheet().catch((e) => console.error('Schedule sheet init failed:', e));
       await postSchedulePanel(guild).catch((e) => console.error('Schedule panel post failed:', e));
+      await postCommandGuide(guild).catch((e) => console.error('Command guide post failed:', e));
       // Periodic reminder for unclaimed schedule requests (24h+)
       setInterval(async () => {
         try {
