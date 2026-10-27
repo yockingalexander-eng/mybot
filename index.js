@@ -67,6 +67,10 @@ const commands = [
     .addStringOption((opt) => opt.setName('notes').setDescription('Notes').setRequired(false)),
   new SlashCommandBuilder().setName('myschedule').setDescription('View your schedule requests'),
   new SlashCommandBuilder().setName('openrequests').setDescription('View open (unclaimed) schedule requests'),
+  new SlashCommandBuilder()
+    .setName('reopenschedule')
+    .setDescription('Reopen a completed/no-show schedule back to claimed')
+    .addStringOption((opt) => opt.setName('id').setDescription('Schedule ID (e.g. SCH-...)').setRequired(true)),
 ];
 
 async function registerCommands() {
@@ -324,10 +328,7 @@ async function createScheduleRequest(interaction, data) {
   const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
   const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
   const row = new ActionRowBuilder().addComponents(claimBtn, cancelBtn);
-  await fetchMembersWithRetry(guild).catch(() => {});
-  const pingRoles = [FTO_ROLE_ID, '1327114656489406531'];
-  const pingMembers = [...guild.members.cache.values()].filter((m) => !m.user.bot && pingRoles.some((r) => m.roles.cache.has(r)));
-  const content = (pingMembers.length ? pingMembers.map((m) => `<@${m.id}>`).join(' ') + ' ' : '') + 'New schedule request:';
+  const content = `<@&${FTO_ROLE_ID}> New schedule request:`;
   console.log('createScheduleRequest: sending message');
   const msg = await channel.send({ content, embeds: [embed], components: [row] }).catch((e) => { console.error('channel send failed', e?.message); return null; });
   if (msg) {
@@ -390,6 +391,13 @@ client.once(Events.ClientReady, async (c) => {
   if (GUILD_ID) {
     const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
     if (guild) {
+      try {
+        const ftoRole = guild.roles.cache.get(FTO_ROLE_ID) || await guild.roles.fetch(FTO_ROLE_ID).catch(() => null);
+        if (ftoRole && !ftoRole.mentionable) {
+          await ftoRole.setMentionable(true, 'Enable FTO role pings for schedule requests');
+          console.log('Set FTO role mentionable.');
+        }
+      } catch (e) { console.error('Failed to set FTO role mentionable:', e?.message || e); }
       await runSync(guild);
       await ensureScheduleSheet().catch((e) => console.error('Schedule sheet init failed:', e));
       await postSchedulePanel(guild).catch((e) => console.error('Schedule panel post failed:', e));
@@ -404,10 +412,7 @@ client.once(Events.ClientReady, async (c) => {
             if (!created || now - created < 24 * 60 * 60 * 1000) continue;
             const channel = await client.channels.fetch(s.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
             if (!channel || !channel.isTextBased()) continue;
-            await fetchMembersWithRetry(channel.guild).catch(() => {});
-            const pingRoles = [FTO_ROLE_ID, '1327114656489406531'];
-            const pingMembers = [...channel.guild.members.cache.values()].filter((m) => !m.user.bot && pingRoles.some((r) => m.roles.cache.has(r)));
-            const content = (pingMembers.length ? pingMembers.map((m) => `<@${m.id}>`).join(' ') + ' ' : '') + 'Reminder: unclaimed schedule request:';
+            const content = `<@&${FTO_ROLE_ID}> Reminder: unclaimed schedule request:`;
             const embed = new EmbedBuilder()
               .setTitle('Unclaimed Schedule Reminder')
               .setColor(0xffa500)
@@ -555,6 +560,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const lines = open.map((s) => `• ${s.probationary}: ${s.type} on ${s.date} at ${s.time} (ID: ${s.id})`);
       await interaction.editReply(lines.join('\n').slice(0, 1900));
+    } else if (interaction.commandName === 'reopenschedule') {
+      await interaction.deferReply({ flags: 64 });
+      try {
+        const id = interaction.options.getString('id');
+        const sched = await getSchedule(id);
+        if (!sched) { await interaction.editReply('Schedule not found.'); return; }
+        const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
+        if (!hasFTO) { await interaction.editReply('Only FTOs can reopen schedules.'); return; }
+        const reopenStatus = sched.claimedBy ? 'Claimed' : 'Open';
+        await updateSchedule(id, { status: reopenStatus, completedBy: '', completedAt: '' });
+        const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
+        if (channel && sched.messageId) {
+          const msg = await channel.messages.fetch(sched.messageId).catch(() => null);
+          if (msg) {
+            const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
+              msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sched.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
+            );
+            let components = [];
+            if (reopenStatus === 'Claimed') {
+              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
+              const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
+              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
+            } else {
+              const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
+              const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
+              components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
+            }
+            await msg.edit({ embeds: [embed], components }).catch(() => {});
+          }
+        }
+        await auditLog(interaction.guild, {
+          actor: interaction.user.displayName || interaction.user.username,
+          action: 'Schedule Reopened',
+          target: sched.probationary,
+          details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
+        });
+        await interaction.editReply(`Reopened schedule ${id} (${reopenStatus}).`);
+      } catch (e) {
+        console.error(e);
+        await interaction.editReply('Failed to reopen schedule.');
+      }
     }
     return;
   }
@@ -579,7 +625,67 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
     const [action, memberId] = interaction.customId.split(':');
-    if (action === 'sched_claim' || action === 'sched_cancel' || action === 'sched_complete' || action === 'sched_noshow') {
+    if (action === 'sched_reopen') {
+      try {
+        await interaction.deferUpdate();
+        const id = memberId;
+        const sched = await getSchedule(id);
+        if (!sched) { await interaction.followUp({ content: 'Schedule request not found.', flags: 64 }); return; }
+        const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
+        if (!hasFTO) { await interaction.followUp({ content: 'Only FTOs can reopen requests.', flags: 64 }); return; }
+        const reopenStatus = sched.claimedBy ? 'Claimed' : 'Open';
+        await updateSchedule(id, { status: reopenStatus, completedBy: '', completedAt: '' });
+        const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
+        if (channel && sched.messageId) {
+          const msg = await channel.messages.fetch(sched.messageId).catch(() => null);
+          if (msg) {
+            const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
+              msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sched.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
+            );
+            let components = [];
+            if (reopenStatus === 'Claimed') {
+              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
+              const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
+              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
+            } else {
+              const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
+              const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
+              components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
+            }
+            await msg.edit({ embeds: [embed], components }).catch((e) => console.error('msg edit failed', e?.message));
+          }
+        }
+        await auditLog(interaction.guild, {
+          actor: interaction.user.displayName || interaction.user.username,
+          action: 'Schedule Reopened',
+          target: sched.probationary,
+          details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
+        });
+        await interaction.followUp({ content: `Reopened schedule (${reopenStatus}).`, flags: 64 });
+      } catch (e) {
+        console.error(e);
+        await interaction.followUp({ content: 'Failed to reopen request.', flags: 64 }).catch(() => {});
+      }
+      return;
+    }
+    // Complete / No-Show require a confirmation modal to avoid accidental clicks
+    if (action === 'sched_complete' || action === 'sched_noshow') {
+      try {
+        const label = action === 'sched_complete' ? 'Complete' : 'No-Show';
+        const modal = new ModalBuilder().setCustomId(`${action}_confirm:${memberId}`).setTitle(`Confirm ${label}`);
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId('confirm').setLabel(`Type ${label.toUpperCase()} to confirm`).setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
+        await interaction.showModal(modal);
+      } catch (e) {
+        console.error('confirm modal failed', e);
+        await interaction.reply({ content: 'Failed to open confirmation.', flags: 64 }).catch(() => {});
+      }
+      return;
+    }
+    if (action === 'sched_claim' || action === 'sched_cancel') {
       try {
         await interaction.deferUpdate();
         const id = memberId;
@@ -651,37 +757,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
             details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
           });
           await interaction.followUp({ content: 'Your schedule request was canceled.', flags: 64 });
-        } else if (action === 'sched_complete' || action === 'sched_noshow') {
-          if (sched.status !== 'Claimed') {
-            await interaction.followUp({ content: 'Request must be claimed first.', flags: 64 });
-            return;
-          }
-          const ftoName = interaction.user.displayName || interaction.user.username;
-          const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
-          if (!hasFTO) {
-            await interaction.followUp({ content: 'Only FTOs can close requests.', flags: 64 });
-            return;
-          }
-          const newStatus = action === 'sched_complete' ? 'Completed' : 'No-Show';
-          const now = new Date().toISOString();
-          await updateSchedule(id, { status: newStatus, completedBy: ftoName, completedAt: now });
-          const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
-          if (channel && sched.messageId) {
-            const msg = await channel.messages.fetch(sched.messageId).catch(() => null);
-            if (msg) {
-              const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
-                msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: newStatus, inline: false } : f))
-              );
-              await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
-            }
-          }
-          await auditLog(interaction.guild, {
-            actor: ftoName,
-            action: `Schedule ${newStatus}`,
-            target: sched.probationary,
-            details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
-          });
-          await interaction.followUp({ content: `Marked as ${newStatus}.`, flags: 64 });
         }
       } catch (e) {
         console.error(e);
@@ -738,21 +813,65 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isModalSubmit()) {
-    if (interaction.customId !== 'sched_modal') return;
-    console.log('sched_modal submitted by', interaction.user.tag);
-    await interaction.deferReply({ flags: 64 });
-    const data = {
-      type: interaction.fields.getTextInputValue('type'),
-      date: interaction.fields.getTextInputValue('date'),
-      time: interaction.fields.getTextInputValue('time'),
-      duration: 60,
-      notes: interaction.fields.getTextInputValue('notes'),
-    };
-    try {
-      await createScheduleRequest(interaction, data);
-    } catch (e) {
-      console.error('createScheduleRequest failed', e);
-      await interaction.editReply({ content: 'Failed to create schedule. Check bot logs.', flags: 64 }).catch(() => {});
+    const [modalAction, modalId] = interaction.customId.split(':');
+    if (modalAction === 'sched_modal') {
+      console.log('sched_modal submitted by', interaction.user.tag);
+      await interaction.deferReply({ flags: 64 });
+      const data = {
+        type: interaction.fields.getTextInputValue('type'),
+        date: interaction.fields.getTextInputValue('date'),
+        time: interaction.fields.getTextInputValue('time'),
+        duration: 60,
+        notes: interaction.fields.getTextInputValue('notes'),
+      };
+      try {
+        await createScheduleRequest(interaction, data);
+      } catch (e) {
+        console.error('createScheduleRequest failed', e);
+        await interaction.editReply({ content: 'Failed to create schedule. Check bot logs.', flags: 64 }).catch(() => {});
+      }
+      return;
+    }
+    if (modalAction === 'sched_complete_confirm' || modalAction === 'sched_noshow_confirm') {
+      await interaction.deferReply({ flags: 64 });
+      try {
+        const id = modalId;
+        const sched = await getSchedule(id);
+        if (!sched) { await interaction.editReply({ content: 'Schedule request not found.', flags: 64 }); return; }
+        if (sched.status !== 'Claimed') { await interaction.editReply({ content: 'Request must be claimed first.', flags: 64 }); return; }
+        const ftoName = interaction.user.displayName || interaction.user.username;
+        const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
+        if (!hasFTO) { await interaction.editReply({ content: 'Only FTOs can close requests.', flags: 64 }); return; }
+        const expected = modalAction === 'sched_complete_confirm' ? 'COMPLETE' : 'NO-SHOW';
+        const typed = (interaction.fields.getTextInputValue('confirm') || '').trim().toUpperCase();
+        if (typed !== expected) { await interaction.editReply({ content: `Confirmation failed. Type ${expected} exactly.`, flags: 64 }); return; }
+        const newStatus = modalAction === 'sched_complete_confirm' ? 'Completed' : 'No-Show';
+        const now = new Date().toISOString();
+        await updateSchedule(id, { status: newStatus, completedBy: ftoName, completedAt: now });
+        const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
+        if (channel && sched.messageId) {
+          const msg = await channel.messages.fetch(sched.messageId).catch(() => null);
+          if (msg) {
+            const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
+              msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: newStatus, inline: false } : f))
+            );
+            const reopenBtn = new ButtonBuilder().setCustomId(`sched_reopen:${id}`).setLabel('Reopen').setStyle(ButtonStyle.Secondary);
+            const row = new ActionRowBuilder().addComponents(reopenBtn);
+            await msg.edit({ embeds: [embed], components: [row] }).catch((e) => console.error('msg edit failed', e?.message));
+          }
+        }
+        await auditLog(interaction.guild, {
+          actor: ftoName,
+          action: `Schedule ${newStatus}`,
+          target: sched.probationary,
+          details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
+        });
+        await interaction.editReply({ content: `Marked as ${newStatus}.`, flags: 64 });
+      } catch (e) {
+        console.error(e);
+        await interaction.editReply({ content: 'Failed to process request.', flags: 64 }).catch(() => {});
+      }
+      return;
     }
     return;
   }
