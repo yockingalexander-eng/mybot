@@ -63,7 +63,6 @@ const commands = [
     .addStringOption((opt) => opt.setName('notes').setDescription('Notes').setRequired(false)),
   new SlashCommandBuilder().setName('myschedule').setDescription('View your schedule requests'),
   new SlashCommandBuilder().setName('openrequests').setDescription('View open (unclaimed) schedule requests'),
-  new SlashCommandBuilder().setName('revertcompleted').setDescription('Revert all completed schedules back to claimed/open (admin)'),
   new SlashCommandBuilder()
     .setName('reopenschedule')
     .setDescription('Reopen a completed/no-show schedule back to claimed')
@@ -156,13 +155,13 @@ async function postCommandGuide(guild) {
       { name: 'Button Flows', value:
         'Schedule panel (applicant channel) — "Create Schedule" opens a form; or use `/schedule`.\n' +
         'Claim — FTO claims an open request; applicant is notified.\n' +
-        'No-Show — type `NO-SHOW` to confirm; marks as no-show and adds a Reopen button.\n' +
+        'Complete / No-Show — Complete is immediate; No-Show requires typing `NO-SHOW` to confirm. Adds a Reopen button.\n' +
         'Reopen — reverts a completed/no-show schedule back to Claimed or Open.\n' +
         'Cancel — requester cancels their own open request.',
         inline: false },
       { name: 'Tips', value:
         'You can request multiple session types in one request (e.g. `Interview, Ride-Along`).\n' +
-        'Statuses: Open → Claimed → No-Show / Canceled.\n' +
+        'Statuses: Open → Claimed → Completed / No-Show / Canceled.\n' +
         'If you complete a session by accident, use the Reopen button or `/reopenschedule`.',
         inline: false }
     );
@@ -407,7 +406,6 @@ client.once(Events.ClientReady, async (c) => {
       await runSync(guild);
       await ensureScheduleSheet().catch((e) => console.error('Schedule sheet init failed:', e));
       await postSchedulePanel(guild).catch((e) => console.error('Schedule panel post failed:', e));
-      await revertCompletedSchedules().catch((e) => console.error('Revert completed failed:', e));
       await postCommandGuide(guild).catch((e) => console.error('Command guide post failed:', e));
       // Periodic reminder for unclaimed schedule requests (24h+)
       setInterval(async () => {
@@ -568,16 +566,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const lines = open.map((s) => `• ${s.probationary}: ${s.type} on ${s.date} at ${s.time} (ID: ${s.id})`);
       await interaction.editReply(lines.join('\n').slice(0, 1900));
-    } else if (interaction.commandName === 'revertcompleted') {
-      await interaction.deferReply({ flags: 64 });
-      try {
-        await revertCompletedSchedules();
-        await scanAndRevertCompletedMessages();
-        await interaction.editReply('Revert completed schedules: done. Check bot logs for details.');
-      } catch (e) {
-        console.error(e);
-        await interaction.editReply('Failed to revert. Check bot logs.');
-      }
     } else if (interaction.commandName === 'reopenschedule') {
       await interaction.deferReply({ flags: 64 });
       try {
@@ -597,8 +585,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             let components = [];
             if (reopenStatus === 'Claimed') {
+              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              components = [new ActionRowBuilder().addComponents(noshowBtn)];
+              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
             } else {
               const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
               const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
@@ -661,8 +650,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             let components = [];
             if (reopenStatus === 'Claimed') {
+              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              components = [new ActionRowBuilder().addComponents(noshowBtn)];
+              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
             } else {
               const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
               const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
@@ -681,6 +671,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } catch (e) {
         console.error(e);
         await interaction.followUp({ content: 'Failed to reopen request.', flags: 64 }).catch(() => {});
+      }
+      return;
+    }
+    // Complete: immediate (no confirmation)
+    if (action === 'sched_complete') {
+      try {
+        await interaction.deferUpdate();
+        const id = memberId;
+        const sched = await getSchedule(id);
+        if (!sched) { await interaction.followUp({ content: 'Schedule request not found.', flags: 64 }); return; }
+        if (sched.status !== 'Claimed') { await interaction.followUp({ content: 'Request must be claimed first.', flags: 64 }); return; }
+        const ftoName = interaction.user.displayName || interaction.user.username;
+        const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
+        if (!hasFTO) { await interaction.followUp({ content: 'Only FTOs can close requests.', flags: 64 }); return; }
+        const now = new Date().toISOString();
+        await updateSchedule(id, { status: 'Completed', completedBy: ftoName, completedAt: now });
+        const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
+        if (channel && sched.messageId) {
+          const msg = await channel.messages.fetch(sched.messageId).catch(() => null);
+          if (msg) {
+            const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
+              msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: 'Completed', inline: false } : f))
+            );
+            const reopenBtn = new ButtonBuilder().setCustomId(`sched_reopen:${id}`).setLabel('Reopen').setStyle(ButtonStyle.Secondary);
+            const row = new ActionRowBuilder().addComponents(reopenBtn);
+            await msg.edit({ embeds: [embed], components: [row] }).catch((e) => console.error('msg edit failed', e?.message));
+          }
+        }
+        await auditLog(interaction.guild, {
+          actor: ftoName,
+          action: 'Schedule Completed',
+          target: sched.probationary,
+          details: `${sched.type} ${sched.date} ${sched.time} ID ${id}`,
+        });
+        await interaction.followUp({ content: 'Marked as Completed.', flags: 64 });
+      } catch (e) {
+        console.error(e);
+        await interaction.followUp({ content: 'Failed to process request.', flags: 64 }).catch(() => {});
       }
       return;
     }
@@ -730,8 +758,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
               const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
                 msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: `Claimed by ${ftoName}`, inline: false } : f))
               );
+              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              const row = new ActionRowBuilder().addComponents(noshowBtn);
+              const row = new ActionRowBuilder().addComponents(completeBtn, noshowBtn);
               await msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
             }
           }
