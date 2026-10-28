@@ -63,6 +63,7 @@ const commands = [
     .addStringOption((opt) => opt.setName('notes').setDescription('Notes').setRequired(false)),
   new SlashCommandBuilder().setName('myschedule').setDescription('View your schedule requests'),
   new SlashCommandBuilder().setName('openrequests').setDescription('View open (unclaimed) schedule requests'),
+  new SlashCommandBuilder().setName('revertcompleted').setDescription('Revert all completed schedules back to claimed/open (admin)'),
   new SlashCommandBuilder()
     .setName('reopenschedule')
     .setDescription('Reopen a completed/no-show schedule back to claimed')
@@ -181,7 +182,11 @@ async function postCommandGuide(guild) {
 async function revertCompletedSchedules() {
   try {
     const all = await getAllSchedules();
-    const completed = all.filter((sc) => sc.status === 'Completed');
+    const completed = all.filter((sc) => String(sc.status || '').trim().toLowerCase() === 'completed');
+    const statusCounts = {};
+    for (const sc of all) { const k = String(sc.status || '').trim() || '(blank)'; statusCounts[k] = (statusCounts[k] || 0) + 1; }
+    console.log('Schedule statuses:', JSON.stringify(statusCounts));
+    console.log('Found', all.length, 'schedules,', completed.length, 'completed.');
     if (!completed.length) return;
     console.log(`Reverting ${completed.length} completed schedule(s)...`);
     for (const sc of completed) {
@@ -523,6 +528,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const lines = open.map((s) => `• ${s.probationary}: ${s.type} on ${s.date} at ${s.time} (ID: ${s.id})`);
       await interaction.editReply(lines.join('\n').slice(0, 1900));
+    } else if (interaction.commandName === 'revertcompleted') {
+      await interaction.deferReply({ flags: 64 });
+      try {
+        await revertCompletedSchedules();
+        await interaction.editReply('Revert completed schedules: done. Check bot logs for details.');
+      } catch (e) {
+        console.error(e);
+        await interaction.editReply('Failed to revert. Check bot logs.');
+      }
     } else if (interaction.commandName === 'reopenschedule') {
       await interaction.deferReply({ flags: 64 });
       try {
