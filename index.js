@@ -155,13 +155,13 @@ async function postCommandGuide(guild) {
       { name: 'Button Flows', value:
         'Schedule panel (applicant channel) — "Create Schedule" opens a form; or use `/schedule`.\n' +
         'Claim — FTO claims an open request; applicant is notified.\n' +
-        'Complete / No-Show — type `COMPLETE` or `NO-SHOW` to confirm; marks done and adds a Reopen button.\n' +
+        'No-Show — type `NO-SHOW` to confirm; marks as no-show and adds a Reopen button.\n' +
         'Reopen — reverts a completed/no-show schedule back to Claimed or Open.\n' +
         'Cancel — requester cancels their own open request.',
         inline: false },
       { name: 'Tips', value:
         'You can request multiple session types in one request (e.g. `Interview, Ride-Along`).\n' +
-        'Statuses: Open → Claimed → Completed / No-Show / Canceled.\n' +
+        'Statuses: Open → Claimed → No-Show / Canceled.\n' +
         'If you complete a session by accident, use the Reopen button or `/reopenschedule`.',
         inline: false }
     );
@@ -176,6 +176,39 @@ async function postCommandGuide(guild) {
     await channel.send({ content: `<@&${FTO_ROLE_ID}>`, embeds: [embed] }).catch((e) => console.error('guide send failed', e?.message));
     console.log('Posted new command guide in fto-announcement.');
   }
+}
+
+async function revertCompletedSchedules() {
+  try {
+    const all = await getAllSchedules();
+    const completed = all.filter((sc) => sc.status === 'Completed');
+    if (!completed.length) return;
+    console.log(`Reverting ${completed.length} completed schedule(s)...`);
+    for (const sc of completed) {
+      const reopenStatus = sc.claimedBy ? 'Claimed' : 'Open';
+      await updateSchedule(sc.id, { status: reopenStatus, completedBy: '', completedAt: '' });
+      const channel = await client.channels.fetch(sc.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
+      if (channel && sc.messageId) {
+        const msg = await channel.messages.fetch(sc.messageId).catch(() => null);
+        if (msg) {
+          const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
+            msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sc.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
+          );
+          let components = [];
+          if (reopenStatus === 'Claimed') {
+            const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${sc.id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
+            components = [new ActionRowBuilder().addComponents(noshowBtn)];
+          } else {
+            const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${sc.id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
+            const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${sc.id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
+            components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
+          }
+          await msg.edit({ embeds: [embed], components }).catch((e) => console.error('msg edit failed', e?.message));
+        }
+      }
+    }
+    console.log('Reverted completed schedules.');
+  } catch (e) { console.error('revertCompletedSchedules failed:', e?.message || e); }
 }
 
 async function createScheduleRequest(interaction, data) {
@@ -303,6 +336,7 @@ client.once(Events.ClientReady, async (c) => {
       await runSync(guild);
       await ensureScheduleSheet().catch((e) => console.error('Schedule sheet init failed:', e));
       await postSchedulePanel(guild).catch((e) => console.error('Schedule panel post failed:', e));
+      await revertCompletedSchedules().catch((e) => console.error('Revert completed failed:', e));
       await postCommandGuide(guild).catch((e) => console.error('Command guide post failed:', e));
       // Periodic reminder for unclaimed schedule requests (24h+)
       setInterval(async () => {
@@ -482,9 +516,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             let components = [];
             if (reopenStatus === 'Claimed') {
-              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
+              components = [new ActionRowBuilder().addComponents(noshowBtn)];
             } else {
               const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
               const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
@@ -547,9 +580,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
             );
             let components = [];
             if (reopenStatus === 'Claimed') {
-              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              components = [new ActionRowBuilder().addComponents(completeBtn, noshowBtn)];
+              components = [new ActionRowBuilder().addComponents(noshowBtn)];
             } else {
               const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
               const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
@@ -571,14 +603,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
-    // Complete / No-Show require a confirmation modal to avoid accidental clicks
-    if (action === 'sched_complete' || action === 'sched_noshow') {
+    // No-Show requires a confirmation modal to avoid accidental clicks
+    if (action === 'sched_noshow') {
       try {
-        const label = action === 'sched_complete' ? 'Complete' : 'No-Show';
-        const modal = new ModalBuilder().setCustomId(`${action}_confirm:${memberId}`).setTitle(`Confirm ${label}`);
+        const modal = new ModalBuilder().setCustomId(`sched_noshow_confirm:${memberId}`).setTitle('Confirm No-Show');
         modal.addComponents(
           new ActionRowBuilder().addComponents(
-            new TextInputBuilder().setCustomId('confirm').setLabel(`Type ${label.toUpperCase()} to confirm`).setStyle(TextInputStyle.Short).setRequired(true)
+            new TextInputBuilder().setCustomId('confirm').setLabel('Type NO-SHOW to confirm').setStyle(TextInputStyle.Short).setRequired(true)
           )
         );
         await interaction.showModal(modal);
@@ -618,9 +649,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
               const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
                 msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: `Claimed by ${ftoName}`, inline: false } : f))
               );
-              const completeBtn = new ButtonBuilder().setCustomId(`sched_complete:${id}`).setLabel('Complete').setStyle(ButtonStyle.Success);
               const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-              const row = new ActionRowBuilder().addComponents(completeBtn, noshowBtn);
+              const row = new ActionRowBuilder().addComponents(noshowBtn);
               await msg.edit({ embeds: [embed], components: [row] }).catch(() => {});
             }
           }
@@ -688,7 +718,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       return;
     }
-    if (modalAction === 'sched_complete_confirm' || modalAction === 'sched_noshow_confirm') {
+    if (modalAction === 'sched_noshow_confirm') {
       await interaction.deferReply({ flags: 64 });
       try {
         const id = modalId;
@@ -698,10 +728,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ftoName = interaction.user.displayName || interaction.user.username;
         const hasFTO = interaction.member?.roles?.cache?.has?.(FTO_ROLE_ID) || interaction.member?.roles?.cache?.some?.((r) => /field training officer/i.test(r.name));
         if (!hasFTO) { await interaction.editReply({ content: 'Only FTOs can close requests.', flags: 64 }); return; }
-        const expected = modalAction === 'sched_complete_confirm' ? 'COMPLETE' : 'NO-SHOW';
+        const expected = 'NO-SHOW';
         const typed = (interaction.fields.getTextInputValue('confirm') || '').trim().toUpperCase();
         if (typed !== expected) { await interaction.editReply({ content: `Confirmation failed. Type ${expected} exactly.`, flags: 64 }); return; }
-        const newStatus = modalAction === 'sched_complete_confirm' ? 'Completed' : 'No-Show';
+        const newStatus = 'No-Show';
         const now = new Date().toISOString();
         await updateSchedule(id, { status: newStatus, completedBy: ftoName, completedAt: now });
         const channel = await client.channels.fetch(sched.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
