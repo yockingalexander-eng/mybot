@@ -212,6 +212,7 @@ async function revertCompletedSchedules() {
         }
       }
     }
+    await scanAndRevertCompletedMessages();
     console.log('Reverted completed schedules.');
   } catch (e) { console.error('revertCompletedSchedules failed:', e?.message || e); }
 }
@@ -240,6 +241,45 @@ async function postSchedulePanel(guild) {
     await channel.send(panel).catch((e) => console.error('sched panel send failed', e?.message));
     console.log('Posted new schedule panel.');
   }
+}
+
+async function scanAndRevertCompletedMessages() {
+  try {
+    const channel = await client.channels.fetch(APPLICANT_CHANNEL_ID).catch(() => null);
+    if (!channel || !channel.isTextBased()) return;
+    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!messages) return;
+    for (const msg of messages.values()) {
+      if (!msg.author || msg.author.id !== client.user.id) continue;
+      const embed = msg.embeds && msg.embeds[0];
+      if (!embed) continue;
+      const statusField = (embed.fields || []).find((f) => f.name === 'Status');
+      if (!statusField || !/completed/i.test(statusField.value)) continue;
+      const footer = embed.footer && embed.footer.text ? embed.footer.text : '';
+      const m = footer.match(/Request ID:\s*(.+)/i);
+      const id = m ? m[1].trim() : null;
+      if (!id) continue;
+      const sched = await getSchedule(id).catch(() => null);
+      if (!sched) continue;
+      if (String(sched.status || '').trim().toLowerCase() !== 'completed') continue;
+      const reopenStatus = sched.claimedBy ? 'Claimed' : 'Open';
+      await updateSchedule(id, { status: reopenStatus, completedBy: '', completedAt: '' });
+      const newEmbed = EmbedBuilder.from(embed).setFields(
+        (embed.fields || []).map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sched.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
+      );
+      let components = [];
+      if (reopenStatus === 'Claimed') {
+        const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
+        components = [new ActionRowBuilder().addComponents(noshowBtn)];
+      } else {
+        const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
+        const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
+        components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
+      }
+      await msg.edit({ embeds: [newEmbed], components }).catch((e) => console.error('msg edit failed', e?.message));
+      console.log('Reverted message for', id);
+    }
+  } catch (e) { console.error('scanAndRevertCompletedMessages failed:', e?.message || e); }
 }
 
 async function createScheduleRequest(interaction, data) {
@@ -532,6 +572,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ flags: 64 });
       try {
         await revertCompletedSchedules();
+        await scanAndRevertCompletedMessages();
         await interaction.editReply('Revert completed schedules: done. Check bot logs for details.');
       } catch (e) {
         console.error(e);
