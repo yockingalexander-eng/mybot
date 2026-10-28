@@ -211,6 +211,32 @@ async function revertCompletedSchedules() {
   } catch (e) { console.error('revertCompletedSchedules failed:', e?.message || e); }
 }
 
+async function postSchedulePanel(guild) {
+  const channel = await client.channels.fetch(APPLICANT_CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) return;
+  const embed = new EmbedBuilder()
+    .setTitle('FTO Scheduling')
+    .setDescription('Probationary troopers: request an FTO session (interview, ride-along, or training). Click the button below or use `/schedule`.')
+    .setColor(0x5865f2);
+  const btn = new ButtonBuilder()
+    .setCustomId('sched_create')
+    .setLabel('Create Schedule')
+    .setStyle(ButtonStyle.Primary);
+  const row = new ActionRowBuilder().addComponents(btn);
+  const panel = { embeds: [embed], components: [row] };
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  const existing = messages
+    ? messages.find((m) => m.author.id === client.user.id && m.embeds.some((e) => e.title === 'FTO Scheduling'))
+    : null;
+  if (existing) {
+    await existing.edit(panel).catch((e) => console.error('sched panel edit failed', e?.message));
+    console.log('Updated existing schedule panel.');
+  } else {
+    await channel.send(panel).catch((e) => console.error('sched panel send failed', e?.message));
+    console.log('Posted new schedule panel.');
+  }
+}
+
 async function createScheduleRequest(interaction, data) {
   console.log('createScheduleRequest start', data);
   const guild = interaction.guild;
