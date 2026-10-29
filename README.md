@@ -52,6 +52,20 @@ npm run dev
 
 In Discord, run `/syncfto`. The sheet should populate with FTO members.
 
+## Seeing who is active in Discord
+
+Besides any external "clock-in" system, this bot can report who is currently online in Discord.
+
+- Run `/active` in any channel. It lists roster members grouped by Discord status
+  (Online, Idle, Do Not Disturb, Offline/unknown) and counts how many are active.
+- This relies on Discord **presence** data, which is opt-in per user: members who hide
+  their status in Discord privacy settings may appear as offline/unknown even when online.
+- The bot must have the **Guild Presences** privileged intent enabled:
+  1. Discord Developer Portal -> your application -> Bot -> Privileged Gateway Intents
+     -> enable "Presence Intent".
+  2. The bot code already requests `GatewayIntentBits.GuildPresences` (see `index.js`).
+  Without this intent, `/active` will only ever show everyone as offline.
+
 ## Notes
 
 - Requires Node.js 18+.

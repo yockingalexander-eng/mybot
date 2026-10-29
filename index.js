@@ -40,6 +40,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildPresences,
   ],
 });
 
@@ -63,6 +64,7 @@ const commands = [
     .addStringOption((opt) => opt.setName('notes').setDescription('Notes').setRequired(false)),
   new SlashCommandBuilder().setName('myschedule').setDescription('View your schedule requests'),
   new SlashCommandBuilder().setName('openrequests').setDescription('View open (unclaimed) schedule requests'),
+  new SlashCommandBuilder().setName('active').setDescription('Show which roster members are currently active (online) in Discord'),
   new SlashCommandBuilder()
     .setName('reopenschedule')
     .setDescription('Reopen a completed/no-show schedule back to claimed')
@@ -150,7 +152,8 @@ async function postCommandGuide(guild) {
         '`/openrequests` — View all open (unclaimed) schedule requests.\n' +
         '`/reopenschedule <id>` — Reopen a completed or no-show schedule (FTO only).\n' +
         '`/syncfto` — Manually sync the roster to the Google Sheet (admin).\n' +
-        '`/graduate @member` — Mark a member as Graduated in the roster (admin).',
+        '`/graduate @member` — Mark a member as Graduated in the roster (admin).\n' +
+        '`/active` — Show which roster members are currently active (online) in Discord.',
         inline: false },
       { name: 'Button Flows', value:
         'Schedule panel (applicant channel) — "Create Schedule" opens a form; or use `/schedule`.\n' +
@@ -566,6 +569,40 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const lines = open.map((s) => `• ${s.probationary}: ${s.type} on ${s.date} at ${s.time} (ID: ${s.id})`);
       await interaction.editReply(lines.join('\n').slice(0, 1900));
+    } else if (interaction.commandName === 'active') {
+      await interaction.deferReply({ flags: 64 });
+      try {
+        const guild = interaction.guild;
+        if (!guild) { await interaction.editReply('This command must be used in a server.'); return; }
+        await fetchMembersWithRetry(guild).catch(() => {});
+        try { await guild.members.fetch({ withPresences: true }); } catch (e) { console.warn('presence fetch failed:', e?.message); }
+        const sections = loadSections();
+        const members = guild.members.cache.filter((m) => !m.user.bot && isRosterMember(m, sections));
+        const buckets = { online: [], idle: [], dnd: [], offline: [] };
+        for (const m of members.values()) {
+          const status = m.presence?.status || 'offline';
+          const name = m.displayName || m.user.username;
+          if (status === 'online') buckets.online.push(name);
+          else if (status === 'idle') buckets.idle.push(name);
+          else if (status === 'dnd') buckets.dnd.push(name);
+          else buckets.offline.push(name);
+        }
+        const total = members.size;
+        const activeCount = buckets.online.length + buckets.idle.length + buckets.dnd.length;
+        const out = [];
+        out.push(`**Roster members:** ${total} total — **${activeCount} active** (online/idle/DND), ${buckets.offline.length} offline/unknown.`);
+        const fmt = (label, arr) => arr.length ? `**${label} (${arr.length}):** ${arr.join(', ')}` : `**${label}:** none`;
+        out.push(fmt('Online', buckets.online));
+        out.push(fmt('Idle', buckets.idle));
+        out.push(fmt('Do Not Disturb', buckets.dnd));
+        out.push(fmt('Offline / unknown', buckets.offline));
+        out.push('');
+        out.push('_Note: Discord presence is opt-in per user. Members who hide their status may show as offline/unknown even if online._');
+        await interaction.editReply(out.join('\n').slice(0, 1900));
+      } catch (e) {
+        console.error('active command failed:', e);
+        await interaction.editReply('Failed to fetch presence. Make sure the bot has the Guild Presences privileged intent enabled in the Discord Developer Portal.');
+      }
     } else if (interaction.commandName === 'reopenschedule') {
       await interaction.deferReply({ flags: 64 });
       try {
