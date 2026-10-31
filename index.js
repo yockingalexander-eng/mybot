@@ -19,6 +19,9 @@ const {
 } = require('discord.js');
 const { syncMembers, setStatus, appendAudit, ensureScheduleSheet, appendSchedule, getSchedule, getAllSchedules, updateSchedule } = require('./sheets');
 
+// ============================================================
+// CONFIGURATION  (env vars, constants, section config)
+// ============================================================
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 if (!GUILD_ID) console.warn('DISCORD_GUILD_ID is not set; roster sync and panels will be disabled.');
@@ -27,14 +30,49 @@ const APPLICANT_CHANNEL_ID = '1327114656942391374';
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID || null;
 const SECTIONS_FILE = process.env.SECTIONS_FILE || './sections.json';
 
+// ============================================================
+// UTILITIES  (helpers shared across the bot)
+// ============================================================
 function loadSections() {
   try {
-    return JSON.parse(fs.readFileSync(SECTIONS_FILE, 'utf8'));
-  } catch (e) {
-    return [];
-  }
+    const parsed = JSON.parse(fs.readFileSync(SECTIONS_FILE, 'utf8'));
+    if (Array.isArray(parsed) && parsed.length) return parsed;
+  } catch (e) {}
+  // Fall back to the same defaults used by sheets.js so roster sync works
+  // even when sections.json is missing or empty.
+  return [
+    { title: 'High-command', roles: ['Superintendent', 'Colonel', 'Major', 'Lieutenant Colonel', 'Lt. Colonel', 'Lt Colonel', '1327114656539611218'] },
+    { title: 'Command', roles: ['Captain', 'Lieutenant', '1327114656539611220'] },
+    { title: 'Supervisors', roles: ['Sergeant', 'Master Sergeant', 'Senior Corporal', 'Corporal'] },
+    { title: 'Probationary Troopers', roles: ['Probationary Trooper', 'Probationary Troopers'] },
+  ];
 }
 
+function normalizeTypes(input) {
+  const allowed = ['Interview', 'Ride-Along', 'Training'];
+  const synonyms = {
+    interview: 'Interview',
+    'ride-along': 'Ride-Along',
+    ridealong: 'Ride-Along',
+    'ride along': 'Ride-Along',
+    training: 'Training',
+  };
+  const parts = String(input || '')
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    const key = p.toLowerCase().replace(/\s+/g, ' ');
+    const norm = synonyms[key] || allowed.find((a) => a.toLowerCase() === key) || p;
+    if (!out.includes(norm)) out.push(norm);
+  }
+  return out.length ? out.join(', ') : String(input || '').trim();
+}
+
+// ============================================================
+// DISCORD CLIENT
+// ============================================================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -44,6 +82,9 @@ const client = new Client({
   ],
 });
 
+// ============================================================
+// SLASH COMMANDS  (definitions registered with Discord)
+// ============================================================
 const commands = [
   new SlashCommandBuilder()
     .setName('syncfto')
@@ -71,6 +112,9 @@ const commands = [
     .addStringOption((opt) => opt.setName('id').setDescription('Schedule ID (e.g. SCH-...)').setRequired(true)),
 ];
 
+// ============================================================
+// COMMAND REGISTRATION
+// ============================================================
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const clientId = CLIENT_ID || (await client.application.fetch()).id;
@@ -82,6 +126,9 @@ async function registerCommands() {
   console.log('Slash commands registered.');
 }
 
+// ============================================================
+// ROSTER SYNC  (member fetching + Google Sheet sync)
+// ============================================================
 function isRosterMember(member, sections) {
   const names = new Set(member.roles.cache.map((r) => r.name.toLowerCase()));
   const ids = new Set(member.roles.cache.map((r) => r.id));
@@ -117,8 +164,8 @@ async function fetchMembersWithRetry(guild, attempts = 6) {
 async function syncRoster(guild) {
   await fetchMembersWithRetry(guild);
   const sections = loadSections();
-  const rosterMembers = guild.members.cache.filter((m) => !m.user.bot && isRosterMember(m, sections));
-  const count = await syncMembers([...rosterMembers.values()]);
+  const rosterMembers = [...guild.members.cache.values()].filter((m) => !m.user.bot && isRosterMember(m, sections));
+  const count = await syncMembers(rosterMembers);
   console.log(`Synced ${count} roster members to sheet.`);
   return count;
 }
@@ -127,13 +174,18 @@ let syncChain = Promise.resolve();
 let lastSyncAt = 0;
 let membersLoaded = false;
 function runSync(guild) {
-  syncChain = syncChain
+  const run = syncChain
     .then(() => syncRoster(guild))
-    .then((count) => { lastSyncAt = Date.now(); return count; })
-    .catch((e) => console.error('Sync failed:', e));
-  return syncChain;
+    .then((count) => { lastSyncAt = Date.now(); return count; });
+  // Keep the serialized chain alive even if this run fails, but propagate
+  // the error to the caller so callers can react/report it.
+  syncChain = run.catch((e) => { console.error('Sync failed:', e); });
+  return run;
 }
 
+// ============================================================
+// CHANNEL POSTS  (command guide + schedule panel)
+// ============================================================
 async function postCommandGuide(guild) {
   const channelId = '1563951331587399710';
   const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -181,44 +233,6 @@ async function postCommandGuide(guild) {
   }
 }
 
-async function revertCompletedSchedules() {
-  try {
-    const all = await getAllSchedules();
-    const completed = all.filter((sc) => String(sc.status || '').trim().toLowerCase() === 'completed');
-    const statusCounts = {};
-    for (const sc of all) { const k = String(sc.status || '').trim() || '(blank)'; statusCounts[k] = (statusCounts[k] || 0) + 1; }
-    console.log('Schedule statuses:', JSON.stringify(statusCounts));
-    console.log('Found', all.length, 'schedules,', completed.length, 'completed.');
-    if (!completed.length) return;
-    console.log(`Reverting ${completed.length} completed schedule(s)...`);
-    for (const sc of completed) {
-      const reopenStatus = sc.claimedBy ? 'Claimed' : 'Open';
-      await updateSchedule(sc.id, { status: reopenStatus, completedBy: '', completedAt: '' });
-      const channel = await client.channels.fetch(sc.channelId || APPLICANT_CHANNEL_ID).catch(() => null);
-      if (channel && sc.messageId) {
-        const msg = await channel.messages.fetch(sc.messageId).catch(() => null);
-        if (msg) {
-          const embed = EmbedBuilder.from(msg.embeds[0]).setFields(
-            msg.embeds[0].fields.map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sc.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
-          );
-          let components = [];
-          if (reopenStatus === 'Claimed') {
-            const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${sc.id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-            components = [new ActionRowBuilder().addComponents(noshowBtn)];
-          } else {
-            const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${sc.id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
-            const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${sc.id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
-            components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
-          }
-          await msg.edit({ embeds: [embed], components }).catch((e) => console.error('msg edit failed', e?.message));
-        }
-      }
-    }
-    await scanAndRevertCompletedMessages();
-    console.log('Reverted completed schedules.');
-  } catch (e) { console.error('revertCompletedSchedules failed:', e?.message || e); }
-}
-
 async function postSchedulePanel(guild) {
   const channel = await client.channels.fetch(APPLICANT_CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
@@ -245,45 +259,9 @@ async function postSchedulePanel(guild) {
   }
 }
 
-async function scanAndRevertCompletedMessages() {
-  try {
-    const channel = await client.channels.fetch(APPLICANT_CHANNEL_ID).catch(() => null);
-    if (!channel || !channel.isTextBased()) return;
-    const messages = await channel.messages.fetch({ limit: 100 }).catch(() => null);
-    if (!messages) return;
-    for (const msg of messages.values()) {
-      if (!msg.author || msg.author.id !== client.user.id) continue;
-      const embed = msg.embeds && msg.embeds[0];
-      if (!embed) continue;
-      const statusField = (embed.fields || []).find((f) => f.name === 'Status');
-      if (!statusField || !/completed/i.test(statusField.value)) continue;
-      const footer = embed.footer && embed.footer.text ? embed.footer.text : '';
-      const m = footer.match(/Request ID:\s*(.+)/i);
-      const id = m ? m[1].trim() : null;
-      if (!id) continue;
-      const sched = await getSchedule(id).catch(() => null);
-      if (!sched) continue;
-      if (String(sched.status || '').trim().toLowerCase() !== 'completed') continue;
-      const reopenStatus = sched.claimedBy ? 'Claimed' : 'Open';
-      await updateSchedule(id, { status: reopenStatus, completedBy: '', completedAt: '' });
-      const newEmbed = EmbedBuilder.from(embed).setFields(
-        (embed.fields || []).map((f) => (f.name === 'Status' ? { name: 'Status', value: reopenStatus === 'Claimed' ? `Claimed by ${sched.claimedBy}` : 'Open — awaiting FTO claim', inline: false } : f))
-      );
-      let components = [];
-      if (reopenStatus === 'Claimed') {
-        const noshowBtn = new ButtonBuilder().setCustomId(`sched_noshow:${id}`).setLabel('No-Show').setStyle(ButtonStyle.Danger);
-        components = [new ActionRowBuilder().addComponents(noshowBtn)];
-      } else {
-        const claimBtn = new ButtonBuilder().setCustomId(`sched_claim:${id}`).setLabel('Claim').setStyle(ButtonStyle.Success);
-        const cancelBtn = new ButtonBuilder().setCustomId(`sched_cancel:${id}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
-        components = [new ActionRowBuilder().addComponents(claimBtn, cancelBtn)];
-      }
-      await msg.edit({ embeds: [newEmbed], components }).catch((e) => console.error('msg edit failed', e?.message));
-      console.log('Reverted message for', id);
-    }
-  } catch (e) { console.error('scanAndRevertCompletedMessages failed:', e?.message || e); }
-}
-
+// ============================================================
+// SCHEDULING  (create/view/claim/complete/cancel/reopen)
+// ============================================================
 async function createScheduleRequest(interaction, data) {
   console.log('createScheduleRequest start', data);
   const guild = interaction.guild;
@@ -353,6 +331,9 @@ async function createScheduleRequest(interaction, data) {
   console.log('createScheduleRequest: done');
 }
 
+// ============================================================
+// AUDIT LOG
+// ============================================================
 async function auditLog(guild, { actor, action, target, details }) {
   const ts = new Date().toISOString();
   try {
@@ -384,6 +365,9 @@ async function auditLog(guild, { actor, action, target, details }) {
   console.log(`[AUDIT] ${actor} | ${action} | ${target} | ${details}`);
 }
 
+// ============================================================
+// BOT STARTUP  (ready, periodic tasks)
+// ============================================================
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   try {
@@ -406,7 +390,7 @@ client.once(Events.ClientReady, async (c) => {
           console.log('Set FTO role mentionable.');
         }
       } catch (e) { console.error('Failed to set FTO role mentionable:', e?.message || e); }
-      await runSync(guild);
+      try { await runSync(guild); } catch (e) { console.error('Initial sync failed:', e); }
       await ensureScheduleSheet().catch((e) => console.error('Schedule sheet init failed:', e));
       await postSchedulePanel(guild).catch((e) => console.error('Schedule panel post failed:', e));
       await postCommandGuide(guild).catch((e) => console.error('Command guide post failed:', e));
@@ -454,15 +438,19 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
+// ============================================================
+// MEMBER EVENTS  (join/leave/update -> roster sync)
+// ============================================================
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   const oldRoles = [...(oldMember?.roles?.cache?.keys() || [])].sort().join(',');
   const newRoles = [...newMember.roles.cache.keys()].sort().join(',');
   const sections = loadSections();
   const wasRoster = oldMember ? isRosterMember(oldMember, sections) : false;
   const isNowRoster = isRosterMember(newMember, sections);
-  if (oldRoles !== newRoles || (!wasRoster && isNowRoster)) {
+  // Only sync when roster membership changes or a roster member's roles change.
+  if (wasRoster !== isNowRoster || (isNowRoster && oldRoles !== newRoles)) {
     console.log(`Roles changed for ${newMember.user.tag}`);
-    await runSync(newMember.guild);
+    await runSync(newMember.guild).catch((e) => console.error('Sync failed:', e));
   }
 });
 
@@ -488,20 +476,33 @@ client.on(Events.GuildMemberAdd, async (member) => {
   try { await member.fetch(true); } catch (e) { console.warn('Member fetch on join failed:', e?.message); }
   const sections = loadSections();
   if (isRosterMember(member, sections)) {
-    await runSync(member.guild);
+    await runSync(member.guild).catch((e) => console.error('Sync failed:', e));
   }
   // Roles are sometimes applied a few seconds after join; catch that case too
-  setTimeout(() => {
-    runSync(member.guild).catch((e) => console.error('Delayed join sync failed:', e));
+  setTimeout(async () => {
+    try {
+      await member.fetch(true).catch(() => {});
+      const secs = loadSections();
+      if (isRosterMember(member, secs)) {
+        await runSync(member.guild).catch((e) => console.error('Delayed join sync failed:', e));
+      }
+    } catch (e) { console.error('Delayed join check failed:', e); }
   }, 10000);
 });
 
 client.on(Events.GuildMemberRemove, async (member) => {
-  await runSync(member.guild);
+  const sections = loadSections();
+  if (isRosterMember(member, sections)) {
+    await runSync(member.guild).catch((e) => console.error('Sync failed:', e));
+  }
 });
 
+// ============================================================
+// INTERACTIONS  (slash commands, buttons, modals)
+// ============================================================
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand()) {
+    try {
     // Allow commands anywhere in the guild
     if (interaction.commandName === 'syncfto') {
       await interaction.deferReply({ flags: 64 });
@@ -577,7 +578,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await fetchMembersWithRetry(guild).catch(() => {});
         try { await guild.members.fetch({ withPresences: true }); } catch (e) { console.warn('presence fetch failed:', e?.message); }
         const sections = loadSections();
-        const members = guild.members.cache.filter((m) => !m.user.bot && isRosterMember(m, sections));
+        const members = [...guild.members.cache.values()].filter((m) => !m.user.bot && isRosterMember(m, sections));
         const buckets = { online: [], idle: [], dnd: [], offline: [] };
         for (const m of members.values()) {
           const status = m.presence?.status || 'offline';
@@ -587,7 +588,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           else if (status === 'dnd') buckets.dnd.push(name);
           else buckets.offline.push(name);
         }
-        const total = members.size;
+        const total = members.length;
         const activeCount = buckets.online.length + buckets.idle.length + buckets.dnd.length;
         const out = [];
         out.push(`**Roster members:** ${total} total — **${activeCount} active** (online/idle/DND), ${buckets.offline.length} offline/unknown.`);
@@ -645,6 +646,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply('Failed to reopen schedule.');
       }
     }
+    } catch (e) {
+      console.error('Slash command failed:', interaction.commandName, e);
+      const reply = interaction.deferred || interaction.replied ? interaction.editReply : interaction.reply.bind(interaction);
+      await reply({ content: 'Something went wrong. Check bot logs.', flags: 64 }).catch(() => {});
+    }
     return;
   }
 
@@ -665,6 +671,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } catch (e) {
         console.error('sched_create failed', e);
         await interaction.reply({ content: 'Failed to open form.', flags: 64 }).catch(() => {});
+        return;
       }
     }
     const [action, memberId] = interaction.customId.split(':');
@@ -911,6 +918,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 }
 });
 
+// ============================================================
+// ERROR HANDLING + LOGIN
+// ============================================================
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 client.on('error', (e) => console.error('Client error:', e));
 client.login(TOKEN);

@@ -2,6 +2,9 @@ const { google } = require('googleapis');
 const fs = require('fs');
 require('dotenv').config();
 
+// ============================================================
+// CONFIGURATION
+// ============================================================
 function parseSheetId(raw) {
   if (!raw) return raw;
   const m = raw.match(/\/d\/([a-zA-Z0-9-_]+)/);
@@ -14,6 +17,9 @@ const SHEET_NAME = process.env.SHEET_NAME || 'Roster';
 // Resolve Google service account credentials in a deployment-friendly way.
 // Supports (in order): a JSON string env var, a base64-encoded JSON env var,
 // a GOOGLE_SERVICE_ACCOUNT_KEY that contains JSON, or a key file path.
+// ============================================================
+// CREDENTIALS
+// ============================================================
 function resolveCredentials() {
   const jsonCandidates = [
     process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
@@ -204,6 +210,9 @@ function probationaryPhase(member) {
   return 'Probationary';
 }
 
+// ============================================================
+// ROSTER SYNC  (read/write roster blocks to Google Sheet)
+// ============================================================
 async function syncMembers(members) {
   const sheets = await getClient();
   await ensureSheet();
@@ -385,52 +394,6 @@ async function syncMembers(members) {
   return hcMembers.length + cmdMembers.length + supMembers.length + probMembers.length;
 }
 
-async function setAssignedFTO(discordId, ftoName) {
-  const sheets = await getClient();
-  await ensureSheet();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:Z`,
-  });
-  const rows = res.data.values || [];
-  for (let i = 0; i < rows.length; i++) {
-    if ((rows[i][4] || '').toString().trim() === String(discordId)) {
-      const row = i + 1;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `${SHEET_NAME}!F${row}`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: { values: [[ftoName]] },
-      });
-      return true;
-    }
-  }
-  return false;
-}
-
-async function getAssignedFTO(discordId) {
-  const map = await getAssignedFTOMap();
-  return map.get(String(discordId)) || '';
-}
-
-async function getAssignedFTOMap() {
-  const sheets = await getClient();
-  await ensureSheet();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:Z`,
-  });
-  const rows = res.data.values || [];
-  const map = new Map();
-  for (const row of rows) {
-    const id = (row[4] || '').toString().trim();
-    if (/^\d{15,20}$/.test(id)) {
-      map.set(id, row[5] || '');
-    }
-  }
-  return map;
-}
-
 async function setStatus(discordId, status) {
   const sheets = await getClient();
   await ensureSheet();
@@ -454,7 +417,13 @@ async function setStatus(discordId, status) {
   return false;
 }
 
+// ============================================================
+// AUDIT LOG
+// ============================================================
 const AUDIT_SHEET = process.env.AUDIT_SHEET_NAME || 'Audit Log';
+// ============================================================
+// SCHEDULE SHEET
+// ============================================================
 const SCHEDULE_SHEET = process.env.SCHEDULE_SHEET_NAME || 'Schedule';
 
 async function ensureAuditSheet() {
@@ -639,4 +608,4 @@ async function updateSchedule(id, updates) {
   return false;
 }
 
-module.exports = { syncMembers, ensureSheet, setAssignedFTO, getAssignedFTO, getAssignedFTOMap, probationaryPhase, setStatus, appendAudit, ensureScheduleSheet, appendSchedule, getSchedule, getAllSchedules, updateSchedule };
+module.exports = { syncMembers, setStatus, appendAudit, ensureScheduleSheet, appendSchedule, getSchedule, getAllSchedules, updateSchedule };
